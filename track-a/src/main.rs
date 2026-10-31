@@ -8,26 +8,19 @@ extern "C" {
 }
 
 #[inline(always)]
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+unsafe fn fast_hash(p: *const u8, len: usize) -> usize {
+    if len >= 8 {
+        let w0 = *(p as *const u64);
+        let w1 = *(p.add(len - 8) as *const u64);
+        let h = w0.wrapping_mul(0x517cc1b727220a95) ^ w1.wrapping_mul(0x9e3779b97f4a7c15) ^ (len as u64);
+        (h ^ (h >> 32)) as usize
+    } else {
+        let mut h = len as u64;
+        for i in 0..len {
+            h = h.wrapping_mul(31).wrapping_add(*p.add(i) as u64);
+        }
+        (h ^ (h >> 32)) as usize
     }
-    h
-}
-
-#[derive(Clone, Copy)]
-struct Record {
-    hour: u8,
-    local_ep: u16,
-    is_err: bool,
-    latency: u32,
-}
-
-struct ThreadParseResult<'a> {
-    records: Vec<Record>,
-    ep_slices: Vec<&'a [u8]>,
 }
 
 #[inline(always)]
@@ -49,11 +42,28 @@ unsafe fn find_char(mut p: *const u8, c: u8) -> *const u8 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Record {
+    hour: u8,
+    local_ep: u16,
+    latency: u32,
+}
+
+struct ThreadParseResult<'a> {
+    records: Vec<Record>,
+    ep_slices: Vec<&'a [u8]>,
+    counts: Vec<u32>,
+    errors: Vec<u32>,
+}
+
 fn parse_chunk<'a>(chunk: &'a [u8]) -> ThreadParseResult<'a> {
     let mut records = Vec::with_capacity(chunk.len() / 70);
-    let mut table_hashes = vec![0u64; 4096];
-    let mut table_ids = vec![0u16; 4096];
+    let mut table_prefixes = vec![0u64; 16384];
+    let mut table_lens = vec![0u16; 16384];
+    let mut table_ids = vec![0u16; 16384];
     let mut ep_slices: Vec<&'a [u8]> = Vec::with_capacity(2048);
+    let mut counts = vec![0u32; 72 * 2048];
+    let mut errors = vec![0u32; 72 * 2048];
 
     unsafe {
         let mut p = chunk.as_ptr();
@@ -69,7 +79,7 @@ fn parse_chunk<'a>(chunk: &'a [u8]) -> ThreadParseResult<'a> {
 
             p = p.add(28); // skip ts and space
 
-            // method: skip until space
+            // method
             p = find_char(p, b' ');
             p = p.add(1);
 
@@ -77,31 +87,32 @@ fn parse_chunk<'a>(chunk: &'a [u8]) -> ThreadParseResult<'a> {
             let ep_start = p;
             p = find_char(p, b' ');
             let ep_len = p as usize - ep_start as usize;
-            let ep_slice = std::slice::from_raw_parts(ep_start, ep_len);
+            let ep_prefix = if ep_len >= 8 { *(ep_start as *const u64) } else { 0 };
             p = p.add(1);
 
-            // intern endpoint
-            let h_val = hash_bytes(ep_slice);
-            let mut slot = (h_val as usize) & 4095;
+            // fast hash interner
+            let h_val = fast_hash(ep_start, ep_len);
+            let mut slot = h_val & 16383;
             let local_ep = loop {
-                if table_hashes[slot] == 0 {
+                if table_lens[slot] == 0 {
                     let id = ep_slices.len() as u16;
-                    table_hashes[slot] = h_val;
+                    table_lens[slot] = ep_len as u16;
+                    table_prefixes[slot] = ep_prefix;
                     table_ids[slot] = id;
-                    ep_slices.push(ep_slice);
+                    ep_slices.push(std::slice::from_raw_parts(ep_start, ep_len));
                     break id;
                 }
-                if table_hashes[slot] == h_val && ep_slices[table_ids[slot] as usize] == ep_slice {
-                    break table_ids[slot];
+                if table_lens[slot] == ep_len as u16 && table_prefixes[slot] == ep_prefix {
+                    if ep_slices[table_ids[slot] as usize] == std::slice::from_raw_parts(ep_start, ep_len) {
+                        break table_ids[slot];
+                    }
                 }
-                slot = (slot + 1) & 4095;
+                slot = (slot + 1) & 16383;
             };
 
-            // status: 3 digits + space
             let is_err = *p == b'5';
             p = p.add(4);
 
-            // latency
             let mut lat: u32 = 0;
             while *p != b'\n' {
                 lat = lat * 10 + (*p - b'0') as u32;
@@ -109,16 +120,21 @@ fn parse_chunk<'a>(chunk: &'a [u8]) -> ThreadParseResult<'a> {
             }
             p = p.add(1);
 
+            let g = (hour_id as usize) * 2048 + (local_ep as usize);
+            counts[g] += 1;
+            if is_err {
+                errors[g] += 1;
+            }
+
             records.push(Record {
                 hour: hour_id,
                 local_ep,
-                is_err,
                 latency: lat,
             });
         }
     }
 
-    ThreadParseResult { records, ep_slices }
+    ThreadParseResult { records, ep_slices, counts, errors }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 1. Unify endpoints across threads
+    // 1. Unify endpoints
     let mut all_unique_eps: Vec<&[u8]> = Vec::new();
     for res in &thread_results {
         for &ep in &res.ep_slices {
@@ -189,53 +205,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     all_unique_eps.sort_unstable();
 
     let num_eps = all_unique_eps.len();
-    let mut remaps = Vec::with_capacity(thread_results.len());
+    let num_groups = 72 * num_eps;
+
+    let mut local_to_canons = Vec::with_capacity(num_threads);
     for res in &thread_results {
         let mut remap = Vec::with_capacity(res.ep_slices.len());
         for &ep in &res.ep_slices {
             let canon_id = all_unique_eps.binary_search(&ep).unwrap() as u16;
             remap.push(canon_id);
         }
-        remaps.push(remap);
+        local_to_canons.push(remap);
     }
 
-    let num_groups = 72 * num_eps;
-    let mut group_counts = vec![0u32; num_groups];
+    // Remap counts & errors
+    let mut group_totals = vec![0u32; num_groups];
     let mut group_errors = vec![0u32; num_groups];
+    let mut thread_group_counts = vec![vec![0u32; num_groups]; num_threads];
 
-    for (t_idx, res) in thread_results.iter().enumerate() {
-        let remap = &remaps[t_idx];
-        for r in &res.records {
-            let canon_ep = remap[r.local_ep as usize];
-            let g = (r.hour as usize) * num_eps + (canon_ep as usize);
-            group_counts[g] += 1;
-            if r.is_err {
-                group_errors[g] += 1;
+    for (t, res) in thread_results.iter().enumerate() {
+        let remap = &local_to_canons[t];
+        for h in 0..72 {
+            for local_ep in 0..res.ep_slices.len() {
+                let local_g = h * 2048 + local_ep;
+                let c = res.counts[local_g];
+                if c > 0 {
+                    let canon_ep = remap[local_ep] as usize;
+                    let canon_g = h * num_eps + canon_ep;
+                    thread_group_counts[t][canon_g] = c;
+                    group_totals[canon_g] += c;
+                    group_errors[canon_g] += res.errors[local_g];
+                }
             }
         }
     }
 
-    let mut group_offsets = vec![0usize; num_groups + 1];
+    let mut group_starts = vec![0usize; num_groups + 1];
     let mut total_records = 0;
     for g in 0..num_groups {
-        group_offsets[g] = total_records;
-        total_records += group_counts[g] as usize;
+        group_starts[g] = total_records;
+        total_records += group_totals[g] as usize;
     }
-    group_offsets[num_groups] = total_records;
+    group_starts[num_groups] = total_records;
+
+    let mut thread_write_ptrs: Vec<Vec<usize>> = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
+        let mut ptrs = vec![0usize; num_groups];
+        for g in 0..num_groups {
+            let mut off = group_starts[g];
+            for i in 0..t {
+                off += thread_group_counts[i][g] as usize;
+            }
+            ptrs[g] = off;
+        }
+        thread_write_ptrs.push(ptrs);
+    }
 
     let mut latencies = vec![0u32; total_records];
-    let mut current_pos = group_offsets.clone();
+    let lat_addr = latencies.as_mut_ptr() as usize;
 
-    for (t_idx, res) in thread_results.iter().enumerate() {
-        let remap = &remaps[t_idx];
-        for r in &res.records {
-            let canon_ep = remap[r.local_ep as usize];
-            let g = (r.hour as usize) * num_eps + (canon_ep as usize);
-            let pos = current_pos[g];
-            latencies[pos] = r.latency;
-            current_pos[g] += 1;
+    // Parallel scatter
+    thread::scope(|s| {
+        for (t, res) in thread_results.iter().enumerate() {
+            let remap = &local_to_canons[t];
+            let mut write_ptrs = std::mem::take(&mut thread_write_ptrs[t]);
+            let records = &res.records;
+
+            s.spawn(move || {
+                let lat_base = lat_addr as *mut u32;
+                unsafe {
+                    for r in records {
+                        let canon_ep = remap[r.local_ep as usize];
+                        let g = (r.hour as usize) * num_eps + (canon_ep as usize);
+                        let dst = write_ptrs[g];
+                        *lat_base.add(dst) = r.latency;
+                        write_ptrs[g] = dst + 1;
+                    }
+                }
+            });
         }
-    }
+    });
 
     // Pre-generate 72 hour strings
     let mut hour_strings = Vec::with_capacity(72);
@@ -251,16 +299,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hour_strings.push(format!("2026-{:02}-{:02}T{:02}:00:00Z", month, day, h).into_bytes());
     }
 
-    // Parallel formatting: split num_groups across available threads
+    // Parallel percentiles and buffer formatting
     let mut thread_buffers = vec![Vec::new(); num_threads];
     let groups_per_thread = (num_groups + num_threads - 1) / num_threads;
 
-    let group_counts_ref = &group_counts;
-    let group_offsets_ref = &group_offsets;
+    let group_totals_ref = &group_totals;
+    let group_starts_ref = &group_starts;
     let group_errors_ref = &group_errors;
     let hour_strings_ref = &hour_strings;
     let all_unique_eps_ref = &all_unique_eps;
-    let lat_addr = latencies.as_mut_ptr() as usize;
 
     thread::scope(|s| {
         for (t_idx, buf) in thread_buffers.iter_mut().enumerate() {
@@ -271,12 +318,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.spawn(move || {
                 let mut local_buf = Vec::with_capacity((g_end - g_start) * 80);
                 for g in g_start..g_end {
-                    let count = group_counts_ref[g] as usize;
+                    let count = group_totals_ref[g] as usize;
                     if count == 0 { continue; }
                     let h_id = g / num_eps;
                     let ep_id = g % num_eps;
 
-                    let start = group_offsets_ref[g];
+                    let start = group_starts_ref[g];
                     let slice = unsafe { std::slice::from_raw_parts_mut((lat_addr as *mut u32).add(start), count) };
                     slice.sort_unstable();
 

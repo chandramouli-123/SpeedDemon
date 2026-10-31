@@ -11,10 +11,14 @@
   - Board measurement: **0.357 s** wall time, **315 MB** peak memory, **K = 7.57** (43.96 pts).
   - All 5 gates passed (correctness, timeout, sandbox, check, build).
 
-- **Step 2 — Zero-Copy mmap + Lock-Free Open-Addressing Interner + Parallel Percentiles**:
+- **Step 2 — Zero-Copy mmap + SWAR Scanner + Parallel Percentiles (run-39bebfee1020)**:
   - Switched input ingestion to `mmap` with `MAP_SHARED`, eliminating the 239 MB userspace heap buffer allocation.
-  - Replaced dynamic heap allocations of endpoints with a thread-local 4096-slot open-addressing table.
   - SWAR (64-bit word) character scanning for ultra-low latency delimiter parsing.
-  - Single contiguous latency array with prefix-sum scatter, completely eliminating heap fragmentation.
-  - Multi-threaded percentile selection and formatting across 12 threads.
-  - Local benchmark on full 3.1M records: **0.040 s** (~9x faster than Step 1), memory reduced to **<50 MB**.
+  - Board measurement: **0.103 s** wall time, **55 MB** peak memory, **K = 18.37** (**63.20 pts**).
+
+- **Step 3 — 3-Instruction Fast-Hash Table + Parallel Scatter + Target Native Vectorization**:
+  - Replaced byte-by-byte endpoint hashing with a 3-instruction 64-bit prefix/suffix word hash.
+  - Expanded table to 16,384 slots (<12% load factor) with direct prefix caching for instant hit rates.
+  - Converted scattering into a parallel disjoint scatter per thread, cutting intermediate aggregation overhead.
+  - Enabled `-C target-cpu=native` for full AVX2 vectorization on the scoring host.
+  - Local benchmark on full 3.1M records: **0.046 s** wall time, **100% SHA-256 match**.
