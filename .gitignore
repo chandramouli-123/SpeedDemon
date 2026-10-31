@@ -1,2 +1,8 @@
 .out/
 data/
+**/target/
+test-data/
+.track-d-backup/
+.DS_Store
+**/.DS_Store
+*.log
